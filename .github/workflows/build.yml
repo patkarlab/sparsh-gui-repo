@@ -1,0 +1,194 @@
+name: Build installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+
+  # ── Windows → .exe installer ──────────────────────────────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyinstaller pillow customtkinter watchdog
+
+      - name: Generate icons
+        run: python make_icon.py
+
+      - name: Build app with PyInstaller
+        run: |
+          pyinstaller --clean --noconfirm `
+            --onedir `
+            --windowed `
+            --name "SPARSH Run Manager" `
+            --add-data "sparsh;sparsh" `
+            --icon "assets/icon.ico" `
+            --hidden-import customtkinter `
+            --hidden-import watchdog.observers `
+            --hidden-import watchdog.observers.polling `
+            --hidden-import watchdog.events `
+            --hidden-import tkinter `
+            --hidden-import tkinter.messagebox `
+            --hidden-import tkinter.filedialog `
+            main.py
+
+      - name: Install Inno Setup 6
+        run: choco install innosetup --version=6.3.3 --yes --no-progress
+
+      - name: Build .exe installer
+        shell: cmd
+        run: |
+          mkdir installer 2>nul || true
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ^
+            /Oinstaller ^
+            /DBundleDir=dist\SPARSH Run Manager ^
+            installer\setup.iss
+
+      - name: Upload .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPARSH-RunManager-Windows
+          path: installer\SPARSH-RunManager-Setup-*.exe
+
+  # ── macOS → .dmg ──────────────────────────────────────────────────────────
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyinstaller pillow customtkinter watchdog
+
+      - name: Generate icons
+        run: python make_icon.py
+
+      - name: Build .app bundle with PyInstaller
+        run: |
+          pyinstaller --clean --noconfirm \
+            --onedir \
+            --windowed \
+            --name "SPARSH Run Manager" \
+            --add-data "sparsh:sparsh" \
+            --icon "assets/icon.icns" \
+            --hidden-import customtkinter \
+            --hidden-import watchdog.observers \
+            --hidden-import watchdog.observers.polling \
+            --hidden-import watchdog.events \
+            --hidden-import tkinter \
+            --hidden-import tkinter.messagebox \
+            --hidden-import tkinter.filedialog \
+            --osx-bundle-identifier com.sparsh.ontrunmanager \
+            main.py
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Build .dmg
+        run: |
+          mkdir -p installer
+          create-dmg \
+            --volname "SPARSH Run Manager" \
+            --volicon "assets/icon.icns" \
+            --window-pos 200 120 \
+            --window-size 600 380 \
+            --icon-size 100 \
+            --icon "SPARSH Run Manager.app" 160 180 \
+            --hide-extension "SPARSH Run Manager.app" \
+            --app-drop-link 430 180 \
+            --no-internet-enable \
+            "installer/SPARSH-RunManager-1.0.0.dmg" \
+            "dist/SPARSH Run Manager.app"
+
+      - name: Upload .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPARSH-RunManager-macOS
+          path: installer/SPARSH-RunManager-*.dmg
+
+  # ── Linux → .tar.gz ───────────────────────────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system Tkinter
+        run: sudo apt-get install -y python3-tk
+
+      - name: Install dependencies
+        run: pip install pyinstaller pillow customtkinter watchdog
+
+      - name: Generate icons
+        run: python make_icon.py
+
+      - name: Build binary with PyInstaller
+        run: |
+          pyinstaller --clean --noconfirm \
+            --onedir \
+            --windowed \
+            --name "SPARSH Run Manager" \
+            --add-data "sparsh:sparsh" \
+            --icon "assets/icon.png" \
+            --hidden-import customtkinter \
+            --hidden-import watchdog.observers \
+            --hidden-import watchdog.observers.polling \
+            --hidden-import watchdog.events \
+            --hidden-import tkinter \
+            --hidden-import tkinter.messagebox \
+            --hidden-import tkinter.filedialog \
+            main.py
+
+      - name: Package as .tar.gz
+        run: |
+          mkdir -p installer
+          tar -czf "installer/SPARSH-RunManager-1.0.0-linux-x86_64.tar.gz" \
+            -C dist "SPARSH Run Manager"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPARSH-RunManager-Linux
+          path: installer/SPARSH-RunManager-*.tar.gz
+
+  # ── Publish all three to a GitHub Release when a tag is pushed ────────────
+  release:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "SPARSH Run Manager ${{ github.ref_name }}"
+          body: |
+            ## Download
+
+            | Platform | File |
+            |---|---|
+            | **Windows 10/11** | `SPARSH-RunManager-Setup-1.0.0.exe` — double-click to install |
+            | **macOS 11+** | `SPARSH-RunManager-1.0.0.dmg` — open and drag to Applications |
+            | **Linux x86_64** | `SPARSH-RunManager-1.0.0-linux-x86_64.tar.gz` — see LINUX_INSTALL.md |
+
+            No Python required on the target machine.
+          files: release-files/*
