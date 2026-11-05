@@ -11,6 +11,8 @@ iteration k analyses sets 1..k:
         <sample>/              run_sample.py output
         <sample>.log
         csv/  karyotype/       collected from every sample in iteration k
+        sample_sheet.csv       sample, sex and blast percentage of the samples with
+                               a prediction, shown in the combined report
         predictions/           predict.py   (once per iteration)
         <report files>         report.py writes to report/; moved up into this folder
         predict_report.log
@@ -26,10 +28,12 @@ iteration still has outputs from every barcode. A barcode with no BAM files at
 all cannot be analysed and is left out at that point.
 
 Samples are analysed one at a time; then predict.py and report.py run once, and
-the iteration folder is mirrored to LTS (BAM files and links are never copied).
-Stop pauses: the running process group is killed and the iteration is kept;
-Start resumes it in the same folder if the run and output folders are unchanged.
+the iteration folder is mirrored to long-term storage (BAM files and links are
+never copied). Stop pauses: the running process group is killed and the iteration
+is kept; Start resumes it in the same folder if the run and output folders are
+unchanged.
 """
+import csv
 import os
 import shlex
 import shutil
@@ -43,19 +47,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
+from .paths import expand, resolve
 from .state import SampleStatus, app_state
 
-# Files expected inside the SPARSH folder
-SPARSH_FILES = {
-    "run_sample": "scripts/run_sample.py",
-    "predict":    "scripts/predict.py",
-    "report":     "scripts/report.py",
-    "reference":  "references/hg19_all.fasta",
-    "manifest":   "references/EPIC-8v2-0_A2.csv",
-    "model_dir":  "sparsh_model_0.4.0",
-}
-
 BAM_EXTENSIONS = {".bam", ".bai", ".cram", ".crai", ".csi"}
+KILL_GRACE_S = 10.0                     # SIGTERM, then SIGKILL after this many seconds
+SAMPLE_SHEET = "sample_sheet.csv"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -75,9 +72,9 @@ def output_name(cfg: dict) -> str:
 
 def output_roots(cfg: dict) -> List[Path]:
     """<local_output>/<name> and, if set, <lts_output>/<name>."""
-    roots = [Path(_expand(cfg.get("local_output", ""))) / output_name(cfg)]
+    roots = [Path(expand(cfg.get("local_output", ""))) / output_name(cfg)]
     if cfg.get("lts_output", "").strip():
-        roots.append(Path(_expand(cfg["lts_output"])) / output_name(cfg))
+        roots.append(Path(expand(cfg["lts_output"])) / output_name(cfg))
     return roots
 
 
@@ -97,12 +94,8 @@ def write_run_info(root: Path, run_folder: str):
     if info.exists():
         return
     root.mkdir(parents=True, exist_ok=True)
-    info.write_text(f"run_folder: {os.path.realpath(_expand(run_folder))}\n"
+    info.write_text(f"run_folder: {os.path.realpath(expand(run_folder))}\n"
                     f"created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-
-def _expand(path: str) -> str:
-    return os.path.expanduser(path.strip()) if path else ""
 
 
 def _announce(message: str):
@@ -235,24 +228,43 @@ def _format_command(argv: List[str]) -> str:
     return "".join(parts)
 
 
-def _build_script(cfg: dict, argv: List[str], log_file: Path) -> str:
+def _build_script(cfg: dict, argv: List[str], log_file: Path, workdir: Path) -> str:
     return "\n".join([
         "set -e",
-        f"source {shlex.quote(_expand(cfg['conda_sh']))}",
-        f"conda activate {shlex.quote(cfg.get('conda_env') or 'sparsh')}",
-        f"cd {shlex.quote(_expand(cfg['sparsh_location']))}",
+        f"source {shlex.quote(expand(cfg.get('conda_sh', '')))}",
+        f"conda activate {shlex.quote(_conda_env(cfg))}",
+        f"cd {shlex.quote(str(workdir))}",
         "set -o pipefail",
         f"{_format_command(argv)} 2>&1 | tee -a {shlex.quote(str(log_file))}",
     ])
 
 
-def _terminate_group(proc: subprocess.Popen, grace: float = 10.0):
-    """SIGTERM the whole process group now; SIGKILL whatever is left after `grace` s."""
+def _conda_env(cfg: dict) -> str:
+    """The environment name, or its folder with ~ expanded when a path is given."""
+    env = str(cfg.get("conda_env") or "sparsh").strip()
+    return expand(env) if "/" in env else env
+
+
+def extra_args(cfg: dict) -> List[str]:
+    """The 'extra options' box split as a shell would, with ~ expanded in paths;
+    a malformed box gives nothing."""
+    text = str(cfg.get("extra_args", "") or "").strip()
+    if not text:
+        return []
+    try:
+        return [os.path.expanduser(tok) if tok.startswith("~") else tok for tok in shlex.split(text)]
+    except ValueError:
+        return []
+
+
+def _terminate_group(proc: subprocess.Popen, grace: float = KILL_GRACE_S) -> threading.Thread:
+    """SIGTERM the whole process group now; SIGKILL whatever is left after `grace` s.
+    Returns the thread that waits for the process, so callers can join it."""
     pgid = proc.pid                     # start_new_session=True -> the shell leads its group
     try:
         os.killpg(pgid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
-        return
+        pass
 
     def _finish():
         try:
@@ -263,12 +275,19 @@ def _terminate_group(proc: subprocess.Popen, grace: float = 10.0):
             os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-    threading.Thread(target=_finish, daemon=True, name="sparsh-kill").start()
+        proc.wait()
+    thread = threading.Thread(target=_finish, daemon=True, name="sparsh-kill")
+    thread.start()
+    return thread
 
 
 def _run_key(cfg: dict) -> Tuple[str, str, str]:
     return (cfg.get("run_folder", "").strip(), cfg.get("local_output", "").strip(),
             output_name(cfg))
+
+
+def _device(cfg: dict) -> str:
+    return "cpu" if str(cfg.get("device", "cuda")).strip().lower() == "cpu" else "cuda"
 
 
 # ── iteration bookkeeping ─────────────────────────────────────────────────────
@@ -286,6 +305,7 @@ class _Iteration:
     failed:   List[str] = field(default_factory=list)
     phase:    str = "samples"            # "samples" -> "aggregate"
     step:     str = ""
+    step_since: float = 0.0              # when the current step began (for the window)
     collected: Dict[str, str] = field(default_factory=dict)   # file -> sample
 
 
@@ -302,6 +322,7 @@ class Runner:
         self._next_k: Optional[int] = None          # next iteration number (lazy)
         self._wait: Optional[dict] = None           # what the next iteration waits for
         self._proc: Optional[subprocess.Popen] = None
+        self._dying: List[Tuple[subprocess.Popen, threading.Thread]] = []   # stopped jobs
         self._worker: Optional[threading.Thread] = None
 
     # ── public API ────────────────────────────────────────────────
@@ -328,12 +349,13 @@ class Runner:
                 try:
                     write_run_info(root, cfg.get("run_folder", ""))
                 except OSError:
-                    pass                          # e.g. LTS not mounted; reported at copy time
+                    pass                          # e.g. long-term storage not mounted; reported at copy time
             if self._worker is None or not self._worker.is_alive():
                 self._worker = threading.Thread(target=self._work_loop, daemon=True,
                                                 name="sparsh-runner")
                 self._worker.start()
-            self._schedule()
+            # No _schedule() here: the first scan of the watcher calls poll(), so a new
+            # iteration is opened only on what the run folder holds now.
             self._publish()
             self._cv.notify_all()
 
@@ -356,9 +378,32 @@ class Runner:
             self._wait = None
             app_state.set_activity(None)
             app_state.set_command(None)
+            if proc is not None:
+                self._dying.append((proc, _terminate_group(proc)))
             self._cv.notify_all()
-        if proc is not None:
-            _terminate_group(proc)
+
+    def wait_for_jobs(self, timeout: float = KILL_GRACE_S + 2.0) -> bool:
+        """Wait until the jobs stop() killed have ended. True if they all have."""
+        with self._cv:
+            threads = [t for _, t in self._dying]
+        deadline = time.time() + timeout
+        for t in threads:
+            t.join(timeout=max(0.0, deadline - time.time()))
+        with self._cv:
+            self._dying = [(p, t) for p, t in self._dying if t.is_alive()]
+            return not self._dying
+
+    def kill_now(self):
+        """SIGKILL the jobs stop() killed that are still running (used when quitting,
+        when the kill thread's own SIGKILL after the grace period would not be sent)."""
+        with self._cv:
+            procs = [p for p, _ in self._dying]
+        for proc in procs:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
     def poll(self):
         """Called after every watcher scan: start the next iteration if its BAM set is ready."""
@@ -460,9 +505,10 @@ class Runner:
     def _open_iteration(self, k: int, names: List[str]):
         cfg = self._cfg
         name = output_name(cfg)
-        iter_dir = Path(_expand(cfg.get("local_output", ""))) / name / str(k)
+        iter_dir = Path(expand(cfg.get("local_output", ""))) / name / str(k)
         it = _Iteration(number=k, out_name=name, run_key=_run_key(cfg),
-                        iter_dir=iter_dir, members=list(names), pending=deque(names))
+                        iter_dir=iter_dir, members=list(names), pending=deque(names),
+                        step_since=time.time())
         self._iter = it
         self._next_k = k + 1
         for n in names:
@@ -481,10 +527,10 @@ class Runner:
                 it, epoch, cfg = self._iter, self._epoch, dict(self._cfg)
                 if it.phase == "samples" and it.pending:
                     job: Optional[str] = it.pending.popleft()
-                    it.running, it.step = job, "run_sample.py"
+                    it.running, it.step, it.step_since = job, "run_sample.py", time.time()
                 else:
                     job = None
-                    it.phase, it.step = "aggregate", "finishing"
+                    it.phase, it.step, it.step_since = "aggregate", "finishing", time.time()
                 self._publish()
             try:
                 if job is not None:
@@ -511,25 +557,10 @@ class Runner:
             return
 
         bams = [b.path for b in sample.bam_files[:sample.link_count(it.number)]]
-        sparsh = Path(_expand(cfg["sparsh_location"]))
+        paths = resolve(cfg)
         sample_out = it.iter_dir / name
         log_file = it.iter_dir / f"{name}.log"
         links_dir = it.iter_dir / "bam_links" / sample.barcode_dir
-
-        argv = ["python", str(sparsh / SPARSH_FILES["run_sample"]),
-                "--sample", name,
-                "--bam", str(links_dir),
-                "--out_dir", str(sample_out),
-                "--reference", str(sparsh / SPARSH_FILES["reference"]),
-                "--manifest", str(sparsh / SPARSH_FILES["manifest"]),
-                "--model_dir", str(sparsh / SPARSH_FILES["model_dir"])]
-        panel = _expand(cfg.get("panel", ""))
-        argv += ["--panel", panel] if panel else ["--no_panel"]
-        if sample.sex.strip():
-            argv += ["--sex", sample.sex.strip()]
-        blast = sample.blast_percent.strip() or str(cfg.get("blast_percent", "")).strip()
-        if blast:
-            argv += ["--blast_percent", blast]
 
         with self._cv:
             if self._epoch != epoch:
@@ -537,47 +568,83 @@ class Runner:
             app_state.set_status(name, SampleStatus.ANALYSING)
 
         ok = False
-        try:
-            if not bams:
-                raise OSError("no complete BAM files to analyse")
-            it.iter_dir.mkdir(parents=True, exist_ok=True)
-            make_bam_links(bams, links_dir)
-        except OSError as exc:
-            log(f"ERROR: could not prepare the BAM links folder {links_dir}: {exc}")
+        if not paths.ok:
+            for problem in paths.problems:
+                log(f"ERROR: {problem}")
         else:
-            span = Path(bams[0]).name + (f" … {Path(bams[-1]).name}" if len(bams) > 1 else "")
-            where = (f"Iteration {it.number}: BAM links folder {links_dir} "
-                     f"({len(bams)} BAM file(s): {span})")
-            log(where)
-            _announce(f"{name}: {where}")
+            argv = ["python", str(paths.run_sample),
+                    "--sample", name,
+                    "--bam", str(links_dir),
+                    "--out_dir", str(sample_out),
+                    "--reference", str(paths.reference),
+                    "--manifest", str(paths.manifest),
+                    "--model_dir", str(paths.model_dir)]
+            argv += ["--panel", str(paths.panel)] if paths.panel else ["--no_panel"]
+            if sample.sex.strip():
+                argv += ["--sex", sample.sex.strip()]
+            blast = sample.blast_percent.strip() or str(cfg.get("blast_percent", "")).strip()
+            if blast:
+                argv += ["--blast_percent", blast]
+            threads = str(cfg.get("threads", "")).strip()
+            if threads.isdigit() and int(threads) > 0:
+                argv += ["--threads", threads]
+            aligner = str(cfg.get("aligner", "")).strip().lower()
+            if aligner in ("dorado", "minimap2"):
+                argv += ["--aligner", aligner]
+            argv += ["--device", _device(cfg)]
+            argv += extra_args(cfg)
             try:
-                with open(log_file, "a") as fh:
-                    fh.write(where + "\n")
-            except OSError:
-                pass
-            script = _build_script(cfg, argv, log_file)
-            log(f"--- Iteration {it.number}: run_sample.py on {len(bams)} BAM file(s) ---")
-            log("CMD: " + script)
-            ok = self._execute(script, epoch, [log], "run_sample.py")
+                if not bams:
+                    raise OSError("no complete BAM files to analyse")
+                it.iter_dir.mkdir(parents=True, exist_ok=True)
+                make_bam_links(bams, links_dir)
+            except OSError as exc:
+                log(f"ERROR: could not prepare the BAM links folder {links_dir}: {exc}")
+            else:
+                span = Path(bams[0]).name + (f" … {Path(bams[-1]).name}" if len(bams) > 1 else "")
+                where = (f"Iteration {it.number}: BAM links folder {links_dir} "
+                         f"({len(bams)} BAM file(s): {span})")
+                log(where)
+                _announce(f"{name}: {where}")
+                try:
+                    with open(log_file, "a") as fh:
+                        fh.write(where + "\n")
+                except OSError:
+                    pass
+                script = _build_script(cfg, argv, log_file, paths.sparsh)
+                log(f"--- Iteration {it.number}: run_sample.py on {len(bams)} BAM file(s) ---")
+                log("CMD: " + script)
+                ok = self._execute(script, epoch, [log], "run_sample.py")
         if self._epoch != epoch:
             return                               # paused: stop() re-queued this sample
 
         if ok:
             self._set_step(it, epoch, "collecting files")
-            n_csv = self._collect(it, name, sample_out / "methylation", "*.csv",
+            n_csv = self._collect(it, name, sample_out / "methylation",
+                                  lambda p: p.suffix.lower() == ".csv",
                                   it.iter_dir / "csv", log)
-            n_kar = self._collect(it, name, sample_out / "copy_number" / "calls", "*",
+            calls_dir = sample_out / "copy_number" / "calls"
+            prefix = name.upper() + "."        # the copy-number module upper-cases names
+            n_kar = self._collect(it, name, calls_dir,
+                                  lambda p: p.name.upper().startswith(prefix),
                                   it.iter_dir / "karyotype", log)
+            if n_csv == 0:
+                log(f"WARNING: no methylation CSV found in {sample_out / 'methylation'}; "
+                    "this sample will be missing from predict.py")
+            if n_kar == 0 and calls_dir.is_dir():
+                log(f"WARNING: no {name}.* files in {calls_dir}; the report will have no "
+                    "karyotype for this sample")
             log(f"Collected {n_csv} file(s) into csv/ and {n_kar} into karyotype/")
             lts_dir = self._lts_iter_dir(cfg, it)
-            if lts_dir is not None and self._set_step(it, epoch, "copying to LTS"):
+            if lts_dir is not None and self._set_step(it, epoch, "copying to long-term storage"):
                 try:
                     copied, left_out = mirror_without_bams(sample_out, lts_dir / name)
                     copy_file(log_file, lts_dir / log_file.name)
-                    log(f"LTS: {copied} file(s) copied, {left_out} BAM/index file(s) "
-                        f"left out -> {lts_dir / name}")
+                    log(f"Long-term storage: {copied} file(s) copied, {left_out} BAM/index "
+                        f"file(s) left out -> {lts_dir / name}")
                 except OSError as exc:
-                    log(f"WARNING: LTS copy failed ({exc}); retried at the end of the iteration")
+                    log(f"WARNING: long-term storage copy failed ({exc}); "
+                        "retried at the end of the iteration")
 
         with self._cv:
             if self._epoch != epoch:
@@ -589,14 +656,15 @@ class Runner:
                 f"Iteration {it.number}: {name} FAILED — see {log_file}")
             self._publish()
 
-    def _collect(self, it: _Iteration, name: str, src: Path, pattern: str,
+    def _collect(self, it: _Iteration, name: str, src: Path, wanted: Callable[[Path], bool],
                  dest: Path, log: Callable[[str], None]) -> int:
+        """Copy the items of src that `wanted` accepts into dest. Returns how many."""
         dest.mkdir(parents=True, exist_ok=True)
         if not src.is_dir():
             log(f"WARNING: {src} not found — nothing copied into {dest.name}/")
             return 0
         count = 0
-        for item in sorted(src.glob(pattern)):
+        for item in sorted(p for p in src.iterdir() if wanted(p)):
             target = dest / item.name
             owner = it.collected.get(str(target))
             if owner and owner != name:
@@ -629,24 +697,29 @@ class Runner:
                     self._cv.notify_all()
             return
 
-        sparsh = Path(_expand(cfg["sparsh_location"]))
+        paths = resolve(cfg)
         d = it.iter_dir
         agg_log = d / "predict_report.log"
         predict_ok: Optional[bool] = None
         report_ok: Optional[bool] = None
 
-        if it.ok:
+        if it.ok and not paths.ok:
+            for problem in paths.problems:
+                log_all(f"ERROR: {problem}")
+            predict_ok = False
+        elif it.ok:
             for stale in (d / "predictions", d / "report"):    # left by a paused attempt
                 if stale.exists():
                     shutil.rmtree(stale, ignore_errors=True)
             (d / "csv").mkdir(parents=True, exist_ok=True)
             (d / "karyotype").mkdir(parents=True, exist_ok=True)
 
-            argv = ["python", str(sparsh / SPARSH_FILES["predict"]),
-                    "--model_dir", str(sparsh / SPARSH_FILES["model_dir"]),
+            argv = ["python", str(paths.predict),
+                    "--model_dir", str(paths.model_dir),
                     "--ont_dir", str(d / "csv"),
-                    "--output_dir", str(d / "predictions")]
-            script = _build_script(cfg, argv, agg_log)
+                    "--output_dir", str(d / "predictions"),
+                    "--device", _device(cfg)]
+            script = _build_script(cfg, argv, agg_log, paths.sparsh)
             if not self._set_step(it, epoch, "predict.py"):
                 return
             log_all(f"--- Iteration {it.number}: predict.py on {len(it.ok)} sample(s) ---")
@@ -656,11 +729,15 @@ class Runner:
                 return
 
             if predict_ok:
-                argv = ["python", str(sparsh / SPARSH_FILES["report"]),
+                argv = ["python", str(paths.report),
                         "--predictions_dir", str(d / "predictions"),
                         "--karyotype_dir", str(d / "karyotype"),
-                        "--output_dir", str(d / "report")]
-                script = _build_script(cfg, argv, agg_log)
+                        "--output_dir", str(d / "report"),
+                        "--title", f"SPARSH report: {it.out_name}, iteration {it.number}"]
+                sheet = self._write_sample_sheet(it, d, log_all)
+                if sheet is not None:
+                    argv += ["--sample_sheet", str(sheet)]
+                script = _build_script(cfg, argv, agg_log, paths.sparsh)
                 if not self._set_step(it, epoch, "report.py"):
                     return
                 log_all(f"--- Iteration {it.number}: report.py ---")
@@ -679,16 +756,16 @@ class Runner:
         lts_ok: Optional[bool] = None
         lts_dir = self._lts_iter_dir(cfg, it)
         if lts_dir is not None:
-            if not self._set_step(it, epoch, "copying iteration to LTS"):
+            if not self._set_step(it, epoch, "copying iteration to long-term storage"):
                 return
             try:
                 copied, left_out = mirror_without_bams(d, lts_dir)
                 lts_ok = True
-                log_all(f"Iteration {it.number} mirrored to LTS: {copied} file(s) copied, "
-                        f"{left_out} BAM/index file(s) and links left out -> {lts_dir}")
+                log_all(f"Iteration {it.number} mirrored to long-term storage: {copied} file(s) "
+                        f"copied, {left_out} BAM/index file(s) and links left out -> {lts_dir}")
             except OSError as exc:
                 lts_ok = False
-                log_all(f"WARNING: LTS copy of iteration {it.number} failed — {exc}")
+                log_all(f"WARNING: long-term storage copy of iteration {it.number} failed — {exc}")
 
         with self._cv:
             if self._epoch != epoch or self._iter is not it:
@@ -707,13 +784,46 @@ class Runner:
             self._publish()
             self._cv.notify_all()
 
+    def _write_sample_sheet(self, it: _Iteration, d: Path,
+                            log_all: Callable[[str], None]) -> Optional[Path]:
+        """
+        sample_sheet.csv (sample, sex, blast_percent) for report.py, listing only the
+        samples that predict.py wrote to predictions.csv: report.py refuses a sheet
+        that names a sample without a prediction.
+        """
+        try:
+            with open(d / "predictions" / "predictions.csv", newline="") as fh:
+                predicted = {row.get("sample", "").strip().upper() for row in csv.DictReader(fh)}
+        except (OSError, csv.Error) as exc:
+            log_all(f"WARNING: predictions.csv could not be read ({exc}); "
+                    "the report is made without the sample sheet")
+            return None
+        rows = []
+        for name in it.ok:
+            s = app_state.get_sample(name)
+            if s is not None and name.strip().upper() in predicted:
+                rows.append((name, s.sex.strip(), s.blast_percent.strip()))
+        if not rows:
+            return None
+        sheet = d / SAMPLE_SHEET
+        try:
+            with open(sheet, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["sample", "sex", "blast_percent"])
+                w.writerows(rows)
+        except OSError as exc:
+            log_all(f"WARNING: {sheet} could not be written ({exc}); "
+                    "the report is made without the sample sheet")
+            return None
+        return sheet
+
     def _move_report_up(self, it: _Iteration, d: Path, log_all: Callable[[str], None]):
         report_dir = d / "report"
         if not report_dir.is_dir():
             log_all(f"WARNING: report.py finished but did not create {report_dir}")
             return
         protected = {"csv", "karyotype", "predictions", "report", "bam_links",
-                     "predict_report.log"}
+                     "predict_report.log", SAMPLE_SHEET}
         protected |= set(it.members) | {f"{m}.log" for m in it.members}
         try:
             moved, kept = move_contents_up(report_dir, d, protected)
@@ -733,6 +843,13 @@ class Runner:
     def _execute(self, script: str, epoch: int,
                  log_fns: List[Callable[[str], None]], label: str) -> bool:
         """Run a bash script in its own process group, streaming output to log_fns."""
+        if not self.wait_for_jobs():             # a job killed by Stop must be gone first
+            for fn in log_fns:
+                fn("WARNING: a stopped job is still ending; waiting for it")
+            self.wait_for_jobs(timeout=60)
+        with self._cv:
+            if self._epoch != epoch:
+                return False
         try:
             proc = subprocess.Popen(
                 ["bash", "-c", script],
@@ -750,8 +867,7 @@ class Runner:
                 self._proc = proc
                 app_state.set_command(script)
         if not current:                          # stopped while launching
-            _terminate_group(proc)
-            proc.wait()
+            _terminate_group(proc).join()
             return False
 
         try:
@@ -780,13 +896,13 @@ class Runner:
         with self._cv:
             if self._epoch != epoch:
                 return False
-            it.step = step
+            it.step, it.step_since = step, time.time()
             self._publish()
             return True
 
     def _lts_iter_dir(self, cfg: dict, it: _Iteration) -> Optional[Path]:
         lts = cfg.get("lts_output", "").strip()
-        return Path(_expand(lts)) / it.out_name / str(it.number) if lts else None
+        return Path(expand(lts)) / it.out_name / str(it.number) if lts else None
 
     def _log_members(self, it: _Iteration, msg: str):
         for n in it.members:
@@ -802,6 +918,7 @@ class Runner:
             return
         app_state.set_activity({
             "iteration": it.number, "phase": it.phase, "step": it.step,
+            "since": it.step_since,
             "running": it.running, "pending": list(it.pending),
             "ok": list(it.ok), "failed": list(it.failed),
             "iter_dir": str(it.iter_dir), "links_dir": str(it.iter_dir / "bam_links"),

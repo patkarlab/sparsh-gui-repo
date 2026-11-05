@@ -1,16 +1,9 @@
 """
-main.py — Entry point for the SPARSH ONT Run Manager.
-Run with: python main.py
+main.py — starts the SPARSH Run Manager window.
+
+    python main.py          (or: python -m sparsh)
 """
-
-from sparsh.gui import App
-
-
-def main():
-    app = App()
-    app.protocol("WM_DELETE_WINDOW", app.on_closing)
-    app.mainloop()
-
+from sparsh.gui import run
 
 if __name__ == "__main__":
-    main()
+    run()

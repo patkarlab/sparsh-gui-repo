@@ -2,6 +2,7 @@
 state.py — shared in-memory state used by the GUI, the watcher and the runner.
 All public AppState methods are thread-safe.
 """
+import os
 import re
 import threading
 import time
@@ -53,8 +54,9 @@ class ThroughputPoint:
 
 
 def normalise_barcode(text: str) -> Optional[str]:
-    """'1', '01', 'barcode01', 'BC01' -> '01'.  None unless it is a barcode from 1 to 99."""
-    m = re.fullmatch(r"(?:barcode|bc)?0*(\d{1,2})", text.strip().lower())
+    """'1', '01', 'barcode01', 'BC01', 'NB01', 'RB01' -> '01'.
+    None unless it is a barcode from 1 to 99."""
+    m = re.fullmatch(r"(?:barcode|bc|nb|rb)?[\s_-]*0*(\d{1,2})", text.strip().lower())
     if not m:
         return None
     n = int(m.group(1))
@@ -120,9 +122,9 @@ class Sample:
 
 def find_bam_pass(run_folder: str) -> str:
     """
-    Breadth-first search (max depth 4) inside run_folder for a directory named
-    'bam_pass'. MinKNOW usually puts it at <run>/<date>_<time>_<flowcell>_<id>/bam_pass.
-    Returns "" if not found.
+    Breadth-first search, up to five folder levels below run_folder, for a directory
+    named 'bam_pass'. MinKNOW usually puts it at <run>/<date>_<time>_<flowcell>_<id>/bam_pass.
+    Returns "" if not found. The first one found (shallowest, then alphabetical) is used.
     """
     root = Path(run_folder)
     if not root.is_dir():
@@ -160,13 +162,25 @@ class AppState:
     # ── Run info ──────────────────────────────────────────────────
 
     def set_run_folder(self, run_folder: str, output_root: str) -> str:
-        """Set the run folder and look for bam_pass inside it (watcher retries if absent)."""
+        """Set the run folder and look for bam_pass inside it (watcher retries if absent).
+        When it is another folder than before, what the watcher found in the old one
+        (each sample's BAM files and data rate) is forgotten, so that no iteration can
+        start on the old run's files before the new folder has been scanned."""
         bam_pass = find_bam_pass(run_folder) if run_folder else ""
         with self._lock:
+            changed = os.path.realpath(run_folder) != os.path.realpath(self._run_folder) \
+                if (run_folder and self._run_folder) else bool(run_folder != self._run_folder)
             self._run_folder = run_folder
             self._bam_pass = bam_pass
             self._output_root = output_root
             self._run_complete = self._uses_index = False
+            if changed:
+                for s in self._samples.values():
+                    s.bam_files = []
+                    s.throughput_history = []
+                    s.files_analysed = 0
+                    if s.status != SampleStatus.DONE:
+                        s.status = SampleStatus.WAITING
         return bam_pass
 
     def set_bam_pass(self, path: str):
@@ -227,13 +241,24 @@ class AppState:
 
     def add_sample(self, name: str, barcode: str, sex: str,
                    blast_percent: str, max_repeats: int) -> bool:
+        """False if a sample of that name exists already. Names that differ only in
+        case count as the same, because predict.py upper-cases sample names."""
         with self._lock:
-            if name in self._samples:
+            if self.sample_named(name) is not None:
                 return False
             self._samples[name] = Sample(name=name, barcode=barcode, sex=sex,
                                          blast_percent=blast_percent,
                                          max_repeats=max_repeats)
             return True
+
+    def sample_named(self, name: str) -> Optional[str]:
+        """The existing sample whose name matches `name` ignoring case, if any."""
+        with self._lock:
+            wanted = name.strip().upper()
+            for existing in self._samples:
+                if existing.upper() == wanted:
+                    return existing
+            return None
 
     def barcode_owner(self, barcode: str) -> Optional[str]:
         with self._lock:
